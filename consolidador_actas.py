@@ -11,7 +11,10 @@ from pypdf import PdfReader, PdfWriter
 #   ActadeMantenimiento-Ruben Rodriguez Gaitan-10072024
 #   ActMtto_Pr_01082025_20238-1051_CelsoMiguelHernandezAvila
 #   ActMtto_Pr_20250721_94888-1199   (sin cliente, fecha AAAAMMDD)
+#   FO-25-1709555_06112025           (sin prefijo Act; el código es "FO-25-1709555")
 PREFIJO = re.compile(r"^Act[a-z]*(?:\s*de\s*Mantenimiento)?", re.IGNORECASE)
+PREFIJO_FO = re.compile(r"^FO-\d+-\d+", re.IGNORECASE)
+SIN_CLIENTE = "(sin cliente)"
 FECHA8 = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 CODIGO = re.compile(r"(?<!\d)(\d{4,6}-\d{3,4})(?!\d)")
 MAYUS_TRAS_MINUS = re.compile(r"(?<=[a-záéíóúñü])(?=[A-ZÁÉÍÓÚÑÜ])")
@@ -44,10 +47,16 @@ def parsear_nombre(nombre: str):
     base = re.sub(r"\.pdf$", "", nombre.strip(), flags=re.IGNORECASE)
     base = re.sub(r"\s*\(\d+\)$", "", base)  # sufijo " (1)" de descargas repetidas
 
-    m_pref = PREFIJO.match(base)
-    if not m_pref:
-        return None
-    resto = base[m_pref.end():]
+    codigo = ""
+    m_fo = PREFIJO_FO.match(base)
+    if m_fo:  # formato FO-25-1709555_06112025: el propio prefijo es el código
+        codigo = m_fo.group(0).upper()
+        resto = base[m_fo.end():]
+    else:
+        m_pref = PREFIJO.match(base)
+        if not m_pref:
+            return None
+        resto = base[m_pref.end():]
 
     # 1) Fecha de 8 dígitos: DDMMAAAA o AAAAMMDD (la primera que sea una fecha real).
     #    Si ambos órdenes fueran válidos a la vez (muy raro), se prefiere DDMMAAAA.
@@ -61,8 +70,7 @@ def parsear_nombre(nombre: str):
         return None
 
     # 2) Código (ej. 99773-1018); es opcional
-    codigo = ""
-    m_cod = CODIGO.search(resto)
+    m_cod = None if codigo else CODIGO.search(resto)
     if m_cod:
         codigo = m_cod.group(1)
         resto = resto[:m_cod.start()] + "_" + resto[m_cod.end():]
@@ -77,7 +85,7 @@ def parsear_nombre(nombre: str):
         if " " not in t:
             t = MAYUS_TRAS_MINUS.sub(" ", t)  # CelsoMiguelHernandez -> Celso Miguel Hernandez
         partes.append(t)
-    cliente = " ".join(partes) or "(sin cliente)"
+    cliente = " ".join(partes) or SIN_CLIENTE
 
     return {"codigo": codigo, "cliente": cliente, "tipo": tipo, "fecha": fecha}
 
@@ -132,6 +140,8 @@ def n_actas(n: int) -> str:
 
 
 def titulo_marcador(fila) -> str:
+    if fila.cliente == SIN_CLIENTE:  # sin nombre: se identifica por el código
+        return f"{fila.fecha:%d/%m/%Y} - Código {fila.codigo or fila.archivo}"
     extra = f" ({fila.codigo})" if fila.codigo else ""
     return f"{fila.fecha:%d/%m/%Y} - {fila.cliente}{extra}"
 
@@ -153,7 +163,7 @@ def main():
         "Sube las actas en PDF", type=["pdf"], accept_multiple_files=True
     )
     if not archivos:
-        st.info("Sube uno o más PDFs. El nombre debe empezar con `Act...` y contener una fecha de 8 dígitos (`DDMMAAAA` o `AAAAMMDD`).")
+        st.info("Sube uno o más PDFs. El nombre debe empezar con `Act...` o `FO-..-...` y contener una fecha de 8 dígitos (`DDMMAAAA` o `AAAAMMDD`).")
         return
 
     df, fallidos = clasificar(archivos)
@@ -164,7 +174,7 @@ def main():
     c3.metric("Sin fecha reconocida", len(fallidos))
 
     if fallidos:
-        st.warning("Estos archivos no se pudieron leer (falta el prefijo `Act...` o una fecha válida de 8 dígitos):")
+        st.warning("Estos archivos no se pudieron leer (falta el prefijo `Act...` / `FO-..-...` o una fecha válida de 8 dígitos):")
         st.write(fallidos)
 
     if df.empty:
