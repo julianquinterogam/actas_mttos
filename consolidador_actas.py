@@ -1,10 +1,13 @@
 import io
 import re
+import zipfile
 from datetime import date
 
 import pandas as pd
+import pikepdf
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
+from PIL import Image
 
 # Formatos de nombre soportados (fecha de 8 dígitos DDMMAAAA o AAAAMMDD, en cualquier posición):
 #   ActMto_99773-1018_Anselmo Hernandez Chipaje_22052024
@@ -154,13 +157,74 @@ def formatear_vista(df: pd.DataFrame) -> pd.DataFrame:
     return vista
 
 
-# ---------------------------------------------------------------- interfaz
-def main():
-    st.set_page_config(page_title="Consolidado Actas de Mantenimientos", page_icon="📄", layout="wide")
-    st.title("📄 Consolidado Actas de Mantenimientos")
+# ---------------------------------------------------------------- compresión de PDFs
+# Niveles de compresión, de más suave a más agresivo: (escala de la imagen, calidad JPEG)
+NIVELES_COMPRESION = (
+    (1.0, 85), (1.0, 70), (0.85, 60), (0.85, 45), (0.7, 35), (0.55, 30), (0.45, 20),
+)
 
+
+@st.cache_data(show_spinner=False)
+def comprimir_pdf(datos: bytes, limite_bytes: int):
+    """Recomprime las imágenes internas del PDF hasta bajar del límite (o agotar niveles).
+
+    Devuelve (pdf_bytes, info) donde info tiene: metodo, escala, calidad, logrado (bool).
+    Si el PDF no tiene imágenes (o ya optimizarlas no ayuda), devuelve el original con
+    logrado = (tamaño original <= límite).
+    """
+    if len(datos) <= limite_bytes:
+        return datos, {"metodo": "ya estaba por debajo del límite", "logrado": True}
+
+    try:
+        pikepdf.open(io.BytesIO(datos)).close()
+    except Exception as e:
+        return None, {"metodo": f"no se pudo abrir: {e or type(e).__name__}", "logrado": False}
+
+    mejor = datos
+    info_mejor = {"metodo": "no tiene imágenes que recomprimir", "logrado": False}
+    for escala, calidad in NIVELES_COMPRESION:
+        pdf = pikepdf.open(io.BytesIO(datos))
+        alguna = False
+        for page in pdf.pages:
+            for _, raw_image in dict(page.images).items():
+                try:
+                    pdfimage = pikepdf.PdfImage(raw_image)
+                    pil_img = pdfimage.as_pil_image()
+                except Exception:
+                    continue  # imagen en un formato que no se puede recomprimir; se deja igual
+                if pil_img.mode not in ("RGB", "L"):
+                    pil_img = pil_img.convert("RGB")
+                if escala < 1.0:
+                    nuevo_w = max(1, int(pil_img.width * escala))
+                    nuevo_h = max(1, int(pil_img.height * escala))
+                    pil_img = pil_img.resize((nuevo_w, nuevo_h), Image.LANCZOS)
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=calidad, optimize=True)
+                nuevo = buf.getvalue()
+                if len(nuevo) < len(raw_image.read_raw_bytes()):
+                    raw_image.Width = pil_img.width
+                    raw_image.Height = pil_img.height
+                    raw_image.write(nuevo, filter=pikepdf.Name("/DCTDecode"))
+                    alguna = True
+        if not alguna:
+            pdf.close()
+            break  # el PDF no tiene imágenes recomprimibles; subir el nivel no cambiará nada
+        out = io.BytesIO()
+        pdf.save(out, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+        pdf.close()
+        resultado = out.getvalue()
+        mejor = resultado
+        info_mejor = {"metodo": f"imágenes al {int(escala * 100)}% de tamaño, calidad {calidad}", "logrado": False}
+        if len(resultado) <= limite_bytes:
+            info_mejor["logrado"] = True
+            return resultado, info_mejor
+    return mejor, info_mejor
+
+
+# ---------------------------------------------------------------- interfaz
+def tab_consolidar():
     archivos = st.file_uploader(
-        "Sube las actas en PDF", type=["pdf"], accept_multiple_files=True
+        "Sube las actas en PDF", type=["pdf"], accept_multiple_files=True, key="actas"
     )
     if not archivos:
         st.info("Sube uno o más PDFs. El nombre debe empezar con `Act...` o `FO-..-...` y contener una fecha de 8 dígitos (`DDMMAAAA` o `AAAAMMDD`).")
@@ -226,6 +290,80 @@ def main():
         mime="application/pdf",
         type="primary",
     )
+
+
+def tab_comprimir():
+    st.write("Sube uno o varios PDFs y cada uno se recomprime, si hace falta, para quedar por debajo del límite.")
+    limite_mb = st.number_input(
+        "Límite de tamaño por archivo (MB)", min_value=1.0, max_value=200.0, value=25.0, step=1.0,
+        help="El límite del reporte SUI es 25 MB.",
+    )
+    limite_bytes = int(limite_mb * 1024 * 1024)
+
+    archivos = st.file_uploader(
+        "Sube los PDFs a comprimir", type=["pdf"], accept_multiple_files=True, key="comprimir"
+    )
+    if not archivos:
+        st.info(f"Sube uno o más PDFs. Se recomprimen las imágenes internas hasta bajar de {limite_mb:g} MB, cuando sea posible.")
+        return
+
+    resultados = []  # (nombre, datos_originales, datos_finales, info)
+    with st.spinner(f"Comprimiendo {n_actas(len(archivos))}..."):
+        for f in archivos:
+            datos = f.getvalue()
+            finales, info = comprimir_pdf(datos, limite_bytes)
+            resultados.append((f.name, datos, finales, info))
+
+    ok = sum(1 for _, _, finales, info in resultados if finales is not None and info["logrado"])
+    c1, c2 = st.columns(2)
+    c1.metric("PDFs subidos", len(resultados))
+    c2.metric(f"Bajaron de {limite_mb:g} MB", ok)
+
+    for nombre, originales, finales, info in resultados:
+        st.markdown(f"**{nombre}**")
+        if finales is None:
+            st.error(f"No se pudo procesar: {info['metodo']}")
+            continue
+
+        antes = len(originales) / 1024 / 1024
+        despues = len(finales) / 1024 / 1024
+        cc1, cc2, cc3 = st.columns([1, 1, 2])
+        cc1.write(f"Antes: {antes:.1f} MB")
+        cc2.write(f"Después: {despues:.1f} MB")
+        if info["logrado"]:
+            cc3.success(f"Bajo el límite — {info['metodo']}" if despues < antes else "Ya estaba bajo el límite")
+        else:
+            cc3.warning(f"No bajó de {limite_mb:g} MB ({info['metodo']}). Quedó en {despues:.1f} MB.")
+
+        nombre_salida = re.sub(r"\.pdf$", "", nombre, flags=re.IGNORECASE) + "_comprimido.pdf"
+        st.download_button(
+            "⬇️ Descargar", data=finales, file_name=nombre_salida, mime="application/pdf",
+            key=f"descargar_{nombre}",
+        )
+        st.divider()
+
+    procesados = [(n, d) for n, _, d, _ in resultados if d is not None]
+    if len(procesados) > 1:
+        buf_zip = io.BytesIO()
+        with zipfile.ZipFile(buf_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for nombre, finales in procesados:
+                nombre_salida = re.sub(r"\.pdf$", "", nombre, flags=re.IGNORECASE) + "_comprimido.pdf"
+                zf.writestr(nombre_salida, finales)
+        st.download_button(
+            "⬇️ Descargar todos en un .zip", data=buf_zip.getvalue(),
+            file_name="pdfs_comprimidos.zip", mime="application/zip", type="primary",
+        )
+
+
+def main():
+    st.set_page_config(page_title="Consolidado Actas de Mantenimientos", page_icon="📄", layout="wide")
+    st.title("📄 Consolidado Actas de Mantenimientos")
+
+    tab1, tab2 = st.tabs(["Consolidar actas", "Comprimir PDFs"])
+    with tab1:
+        tab_consolidar()
+    with tab2:
+        tab_comprimir()
 
 
 if __name__ == "__main__":
