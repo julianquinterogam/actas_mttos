@@ -26,6 +26,7 @@ MESES = {
     1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
     7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
+LIMITE_SUI_MB = 25.0
 
 
 # ---------------------------------------------------------------- lectura de nombres
@@ -283,9 +284,28 @@ def tab_consolidar():
         return
 
     st.caption(f"El PDF unido tendrá {n_actas(len(items) - len(errores))} y {paginas} {'página' if paginas == 1 else 'páginas'}, con un marcador por acta.")
+
+    # ---- Comprimir si supera el límite de SUI
+    peso_mb = len(pdf_bytes) / 1024 / 1024
+    limite_bytes = int(LIMITE_SUI_MB * 1024 * 1024)
+    if peso_mb <= LIMITE_SUI_MB:
+        st.write(f"Peso: {peso_mb:.1f} MB — ya está por debajo del límite de {LIMITE_SUI_MB:g} MB de SUI.")
+        pdf_final = pdf_bytes
+    else:
+        with st.spinner(f"El PDF pesa {peso_mb:.1f} MB, por encima de {LIMITE_SUI_MB:g} MB. Comprimiendo..."):
+            pdf_final, info_comp = comprimir_pdf(pdf_bytes, limite_bytes)
+        peso_final_mb = len(pdf_final) / 1024 / 1024
+        if info_comp["logrado"]:
+            st.success(f"Se comprimió de {peso_mb:.1f} MB a {peso_final_mb:.1f} MB ({info_comp['metodo']}).")
+        else:
+            st.warning(
+                f"No se logró bajar de {LIMITE_SUI_MB:g} MB; quedó en {peso_final_mb:.1f} MB "
+                f"({info_comp['metodo']}). Puede que algunas actas tengan imágenes muy pesadas."
+            )
+
     st.download_button(
         label=f"⬇️ Descargar PDF de {MESES[mes]} {anio}",
-        data=pdf_bytes,
+        data=pdf_final,
         file_name=f"Actas_Mantenimiento_{MESES[mes]}_{anio}.pdf",
         mime="application/pdf",
         type="primary",
@@ -295,7 +315,7 @@ def tab_consolidar():
 def tab_comprimir():
     st.write("Sube uno o varios PDFs y cada uno se recomprime, si hace falta, para quedar por debajo del límite.")
     limite_mb = st.number_input(
-        "Límite de tamaño por archivo (MB)", min_value=1.0, max_value=200.0, value=25.0, step=1.0,
+        "Límite de tamaño por archivo (MB)", min_value=1.0, max_value=200.0, value=LIMITE_SUI_MB, step=1.0,
         help="El límite del reporte SUI es 25 MB.",
     )
     limite_bytes = int(limite_mb * 1024 * 1024)
